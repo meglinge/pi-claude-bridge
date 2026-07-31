@@ -617,14 +617,25 @@ function syncSharedSession(
 			}
 		}
 	}
-	// Only reachable when needsRebuild is false — user-facing history rewrites
-	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call. In practice this
-	// fires only for isolated compact-summary subprocesses.
+	// Pi/OMP history can shrink below cursor without a session_compact event
+	// (context-prune, snapcompact, soft trim, tree edits). The old "Case 1
+	// synthetic" path returned sessionId=null + preserveSharedSession, which
+	// starts Claude with ZERO history while keeping the inflated cursor —
+	// every later turn then also clean-starts. That matches "second message
+	// loses context". When prior messages still exist, force REBUILD from the
+	// current (shorter) Pi history instead. Empty prior is still a true
+	// synthetic/isolated compact summary and keeps the preserve-shared path.
 	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
-		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-		return { sessionId: null, preserveSharedSession: true };
+		if (priorMessages.length === 0) {
+			debug(`Case 1 synthetic: empty prior with shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+			debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+			return { sessionId: null, preserveSharedSession: true };
+		}
+		debug(
+			`Case 3→4: Pi history compressed ${sharedSession.cursor}→${priorMessages.length} msgs ` +
+			`for session ${sharedSession.sessionId.slice(0, 8)}; forcing rebuild so Claude keeps context`,
+		);
+		sharedSession = { ...sharedSession, needsRebuild: true };
 	}
 
 	// REBUILD path
@@ -1509,9 +1520,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				}
 				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
 			} else if (sessionId) {
-				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
+				// Never carry a stale high cursor forward. If Pi later shrinks
+				// history, max(oldCursor, ...) would lock clean-start forever.
+				const cursor = Math.max(context.messages.length, queryCtx.latestCursor);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				sharedSession = { sessionId, cursor, cwd };
+				sharedSession = { sessionId, cursor, cwd, needsRebuild: false, forceRotate: false };
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -1794,11 +1807,27 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 		}
-		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
-			clearSession(`session_start:${event.reason}`);
+		// Stock Pi may pass reason; OMP often emits a bare session_start with no
+		// reason (initial load only). Only clear on explicit new/resume/fork.
+		const reason = (event as { reason?: string } | undefined)?.reason;
+		if (reason === "new" || reason === "resume" || reason === "fork") {
+			clearSession(`session_start:${reason}`);
 		}
 	});
 	pi.on("session_shutdown", () => clearSession("session_shutdown"));
+	// OMP/Pi session switches replace the message array. Drop or rebuild the CC
+	// binding so the next turn cannot REUSE a JSONL from the previous file.
+	pi.on("session_switch", (event) => {
+		const reason = (event as { reason?: string } | undefined)?.reason ?? "switch";
+		if (reason === "new" || reason === "fork" || reason === "handoff") {
+			clearSession(`session_switch:${reason}`);
+			return;
+		}
+		if (sharedSession) {
+			debug(`session_switch:${reason}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
+			sharedSession = { ...sharedSession, needsRebuild: true };
+		}
+	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;

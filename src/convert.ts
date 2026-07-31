@@ -76,7 +76,7 @@ export function convertPiMessages(
 					blocks.push({ type: "text", text: block.text });
 				} else if (block.type === "thinking") {
 					const sig = block.thinkingSignature;
-					const isAnthropicProvider = msg.provider === PROVIDER_ID || msg.api === "anthropic";
+					const isAnthropicProvider = msg.provider === PROVIDER_ID || msg.api === PROVIDER_ID || msg.api === "anthropic";
 					if (isAnthropicProvider && sig) {
 						blocks.push({ type: "thinking", thinking: block.thinking ?? "", signature: sig });
 					}

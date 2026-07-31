@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-bridge",
-  "version": "0.6.4-omp.2",
+  "version": "0.6.4-omp.3",
   "private": false,
   "description": "OMP/Pi extension that uses Claude Code (via Agent SDK) as a model provider and adds an AskClaude tool. Fork with OMP fixes.",
   "keywords": [
