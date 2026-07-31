@@ -1,7 +1,8 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, getAgentDir, keyHint, type CompactionEntry, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, getAgentDir, keyHint, type CompactionEntry, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { runBridgeCompact } from "./pi-compat.js";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
@@ -1808,17 +1809,13 @@ export default function (pi: ExtensionAPI) {
 		);
 		try {
 			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
-			const compaction = await compact(
-				event.preparation,
-				ctx.model,
-				undefined,
-				undefined,
-				event.customInstructions,
-				event.signal,
-				undefined,
-				isolatedStreamFn,
-				undefined,
-			);
+			const compaction = await runBridgeCompact({
+				preparation: event.preparation,
+				model: ctx.model,
+				customInstructions: event.customInstructions,
+				signal: event.signal,
+				streamFn: isolatedStreamFn,
+			});
 			debug(`session_before_compact: takeover complete summaryLen=${compaction.summary.length}`);
 			return { compaction };
 		} catch (err) {

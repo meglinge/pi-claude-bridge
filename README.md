@@ -46,7 +46,9 @@ OMP notes:
 - Thinking levels keep `xhigh` / `max` distinct for Opus 5+.
 - Stale Claude Code session resume ids are dropped when the jsonl is missing.
 
-If install fails with `CONFIG_DIR_NAME` / `compact` missing from OMP's legacy Pi shim, export those from `@oh-my-pi/pi-coding-agent`'s `legacy-pi-coding-agent-shim.ts`, then reinstall.
+This fork avoids static named imports of `compact` / `CONFIG_DIR_NAME`, so OMP plugin validation succeeds even when the host legacy shim omits those exports. Bridge `/compact` takeover resolves `compact` at runtime and cancels cleanly if unavailable.
+
+Optional host improvement: export `CONFIG_DIR_NAME` and `compact` from OMP `legacy-pi-coding-agent-shim.ts` so runtime compact takeover can use the host implementation.
 
 ### Stock Pi
 
