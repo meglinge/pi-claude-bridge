@@ -2,6 +2,8 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-claude-bridge)](https://www.npmjs.com/package/pi-claude-bridge)
 
+Fork of [elidickinson/pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge) with OMP-oriented fixes.
+
 Pi extension that integrates Claude Code via the [Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript). Based initially on [claude-agent-sdk-pi](https://github.com/prateekmedia/claude-agent-sdk-pi) by Prateek Sunal. This fork adds streaming, MCP tool bridging, custom pi tool bridging, session resume/persistence, context sync, thinking support, skills forwarding, and the AskClaude tool.
 
 1. **Provider** — Use Opus/Sonnet/Haiku as models in pi, with all tool calls flowing through pi's TUI
@@ -17,8 +19,41 @@ Pi extension that integrates Claude Code via the [Agent SDK](https://github.com/
 
 ## Install
 
+### Oh My Pi (OMP)
+
+```
+omp plugin install github:meglinge/pi-claude-bridge
+# or after publish:
+# omp plugin install pi-claude-bridge
+```
+
+Config lives at `~/.omp/agent/claude-bridge.json` (global) or `<cwd>/.omp/claude-bridge.json` (project).
+
+```json
+{
+  "askClaude": { "enabled": true, "allowFullMode": true },
+  "provider": {
+    "plan": "max",
+    "pathToClaudeCodeExecutable": "claude",
+    "strictMcpConfig": true
+  }
+}
+```
+
+OMP notes:
+- This fork declares both `omp.extensions` and `pi.extensions`.
+- Debug/diag logs go to the active agent dir (`~/.omp/agent` on OMP), not hardcoded `~/.pi`.
+- Thinking levels keep `xhigh` / `max` distinct for Opus 5+.
+- Stale Claude Code session resume ids are dropped when the jsonl is missing.
+
+If install fails with `CONFIG_DIR_NAME` / `compact` missing from OMP's legacy Pi shim, export those from `@oh-my-pi/pi-coding-agent`'s `legacy-pi-coding-agent-shim.ts`, then reinstall.
+
+### Stock Pi
+
 ```
 pi install npm:pi-claude-bridge
+# fork:
+# pi install git:https://github.com/meglinge/pi-claude-bridge
 ```
 
 ## Provider
@@ -51,7 +86,7 @@ You could also create skills or add something to AGENTS.md to e.g. "Always call 
 
 ## Configuration
 
-Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config directory, usually `.pi/claude-bridge.json` (project; merged over global).
+Config: on stock Pi `~/.pi/agent/claude-bridge.json` / `.pi/claude-bridge.json`; on OMP `~/.omp/agent/claude-bridge.json` / `.omp/claude-bridge.json` (project merged over global via `getAgentDir()` + `CONFIG_DIR_NAME`).
 
 ```json
 {

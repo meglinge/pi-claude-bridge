@@ -6,6 +6,8 @@ import { statSync, readFileSync } from "fs";
 
 export function verifyWrittenSession(jsonlPath: string, expectedSessionId: string, expectedRecordCount: number): string[] {
 	const warnings = [];
+	// A zero-record rebuild is a clean no-op write; no file is expected.
+	if (expectedRecordCount === 0) return warnings;
 	let st;
 	try {
 		st = statSync(jsonlPath);

@@ -8,14 +8,26 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { loadConfig, markStartupNoticeShown } from "../src/config.js";
 
 function withTempHome(fn) {
+	// getAgentDir() resolves via os.homedir(): HOME on POSIX, USERPROFILE on Windows.
+	// Isolate both, plus optional PI_CODING_AGENT_DIR overrides from the host.
 	const oldHome = process.env.HOME;
+	const oldProfile = process.env.USERPROFILE;
+	const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const home = mkdtempSync(join(tmpdir(), "claude-bridge-home-"));
+	const agentDir = join(home, ".pi", "agent");
+	mkdirSync(agentDir, { recursive: true });
 	try {
 		process.env.HOME = home;
+		process.env.USERPROFILE = home;
+		delete process.env.PI_CODING_AGENT_DIR;
 		return fn(home);
 	} finally {
 		if (oldHome === undefined) delete process.env.HOME;
 		else process.env.HOME = oldHome;
+		if (oldProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = oldProfile;
+		if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
 		rmSync(home, { recursive: true, force: true });
 	}
 }

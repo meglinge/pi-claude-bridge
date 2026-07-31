@@ -11,12 +11,15 @@ export function buildModels<T extends { id: string; [key: string]: any }>(piAiMo
 	return MODEL_IDS_IN_ORDER
 		.map((id) => piAiModels.find((m) => m.id === id))
 		.filter((m) => m != null)
-		// Forward thinkingLevelMap so pi-ai's per-model overrides (e.g. opus-4-8
-		// mapping xhigh→xhigh and max→max) are visible to the effort lookup.
-		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap }) => ({
+		// Forward thinking metadata so OMP/pi pickers show the real ladder
+		// (Opus 5 / 4.7+ = low..xhigh..max). Without `thinking`, registerProvider
+		// rebuilds under api="claude-bridge" and falls back to minimal..high.
+		// Also keep thinkingLevelMap for pi-ai effort lookup paths.
+		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinking, thinkingLevelMap }) => ({
 			id,
 			name,
 			reasoning, input, contextWindow, maxTokens,
+			thinking,
 			thinkingLevelMap,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		}));

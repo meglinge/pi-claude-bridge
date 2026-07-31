@@ -1,8 +1,8 @@
 {
   "name": "pi-claude-bridge",
-  "version": "0.6.3",
+  "version": "0.6.4-omp.1",
   "private": false,
-  "description": "Pi extension that uses Claude Code (via Agent SDK) as a model provider and adds an AskClaude tool.",
+  "description": "OMP/Pi extension that uses Claude Code (via Agent SDK) as a model provider and adds an AskClaude tool. Fork with OMP fixes.",
   "keywords": [
     "pi-package",
     "pi",
@@ -14,7 +14,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/elidickinson/pi-claude-bridge.git"
+    "url": "git+https://github.com/meglinge/pi-claude-bridge.git"
   },
   "engines": {
     "node": ">=20"
@@ -54,6 +54,11 @@
     "typescript": "^6.0.3"
   },
   "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "omp": {
     "extensions": [
       "./src/index.ts"
     ]

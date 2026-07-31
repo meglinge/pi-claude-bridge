@@ -1,13 +1,13 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, keyHint, type CompactionEntry, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, getAgentDir, keyHint, type CompactionEntry, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { createSession, deleteSession, getSessionPath, repairToolPairing } from "cc-session-io";
+import { appendFileSync, existsSync, mkdirSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -30,21 +30,32 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 		: () => new _piAi.AssistantMessageEventStream();
 
 // --- Debug logging ---
-// CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
+// CLAUDE_BRIDGE_DEBUG=1 enables debug logging under the active agent dir
+// (~/.omp/agent on OMP, ~/.pi/agent on stock pi). Override with CLAUDE_BRIDGE_DEBUG_PATH.
 
 const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
-const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(homedir(), ".pi", "agent", "claude-bridge.log");
-const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "claude-bridge-diag.log");
-
-// Ensure log directories exist when debug is enabled
-if (DEBUG) {
+function resolveBridgeLogDir(): string {
 	try {
-		mkdirSync(dirname(DEBUG_LOG_PATH), { recursive: true });
-		mkdirSync(dirname(DIAG_LOG_PATH), { recursive: true });
+		return getAgentDir();
 	} catch {
-		// If directory creation fails, debug functions will throw on first use
+		// getAgentDir can throw before agent runtime is ready; fall back for OMP.
+		return join(homedir(), ".omp", "agent");
 	}
 }
+const BRIDGE_LOG_DIR = resolveBridgeLogDir();
+const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(BRIDGE_LOG_DIR, "claude-bridge.log");
+const DIAG_LOG_PATH = join(BRIDGE_LOG_DIR, "claude-bridge-diag.log");
+
+function ensureLogDir(path: string): void {
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+	} catch {
+		// best-effort
+	}
+}
+// Always ensure diag dir exists — session verify calls diagDump even when DEBUG=0.
+ensureLogDir(DIAG_LOG_PATH);
+if (DEBUG) ensureLogDir(DEBUG_LOG_PATH);
 
 // Unique per module evaluation — confirms whether subagents share module state
 const moduleInstanceId = Math.random().toString(36).slice(2, 8);
@@ -58,7 +69,12 @@ function debug(...args: unknown[]) {
 		return JSON.stringify(a);
 	};
 	const msg = args.map(fmt).join(" ");
-	appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
+	try {
+		ensureLogDir(DEBUG_LOG_PATH);
+		appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
+	} catch {
+		// ignore debug IO failures
+	}
 }
 
 // Per-query CLI debug capture. When CLAUDE_BRIDGE_DEBUG=1, ask the Claude Code
@@ -91,7 +107,13 @@ function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string
 function diagDump(label: string, data: Record<string, unknown>) {
 	const ts = new Date().toISOString();
 	const entry = { ts, moduleInstanceId, label, ...data };
-	appendFileSync(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
+	try {
+		ensureLogDir(DIAG_LOG_PATH);
+		appendFileSync(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
+	} catch (e) {
+		// Never let diagnostics take down a turn (e.g. missing ~/.pi on OMP).
+		try { debug(`DIAG write failed: ${(e as Error).message}`); } catch { /* ignore */ }
+	}
 	debug(`DIAG: ${label} (see ${DIAG_LOG_PATH})`);
 }
 
@@ -497,6 +519,24 @@ function safeRealpath(p: string): string {
 	try { return realpathSync(p); } catch (e) { return `<failed: ${(e as Error).message}>`; }
 }
 
+/** True when the Claude Code jsonl for this session id is present on disk. */
+function sessionFileExists(sessionId: string, cwd: string): boolean {
+	try {
+		const path = getSessionPath(sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+		return existsSync(path);
+	} catch {
+		return false;
+	}
+}
+
+/** Drop in-memory session if its jsonl is gone — prevents "No conversation found". */
+function invalidateMissingSharedSession(cwd: string, reason: string): void {
+	if (!sharedSession) return;
+	if (sessionFileExists(sharedSession.sessionId, cwd)) return;
+	debug(`sharedSession invalidated (${reason}): missing jsonl for ${sharedSession.sessionId.slice(0, 8)}`);
+	sharedSession = null;
+}
+
 // Diagnostic snapshot of where a session file was just written. Catches the
 // class of bugs where pi writes to ~/.claude/projects/<X> but CC SDK reads
 // from ~/.claude/projects/<Y> (symlinks, CLAUDE_CONFIG_DIR, hash mismatch).
@@ -557,16 +597,23 @@ function syncSharedSession(
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
 	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
-		const missed = priorMessages.slice(sharedSession.cursor);
-		const trailingAssistantOnly =
-			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
-		if (missed.length === 0 || trailingAssistantOnly) {
-			if (trailingAssistantOnly) {
-				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
+		// Stale in-memory IDs are common after failed first-write / AV wipe /
+		// process restart. Never hand CC a resume id whose jsonl is gone.
+		if (!sessionFileExists(sharedSession.sessionId, cwd)) {
+			debug(`Case 3 aborted: sharedSession ${sharedSession.sessionId.slice(0, 8)} jsonl missing — forcing rebuild`);
+			sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		} else {
+			const missed = priorMessages.slice(sharedSession.cursor);
+			const trailingAssistantOnly =
+				missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
+			if (missed.length === 0 || trailingAssistantOnly) {
+				if (trailingAssistantOnly) {
+					sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
+				}
+				debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+				debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+				return { sessionId: sharedSession.sessionId };
 			}
-			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-			return { sessionId: sharedSession.sessionId };
 		}
 	}
 	// Only reachable when needsRebuild is false — user-facing history rewrites
@@ -604,6 +651,32 @@ function syncSharedSession(
 	});
 	convertAndImportMessages(session, priorMessages, customToolNameToSdk);
 	session.save();
+	// Windows / AV / OneDrive can race a just-created path. If the file is gone
+	// immediately after save, force parent dir + one rewrite before warning.
+	try {
+		statSync(session.jsonlPath);
+	} catch {
+		try {
+			mkdirSync(dirname(session.jsonlPath), { recursive: true });
+			if (session.messages.length === 0 && priorMessages.length > 0) {
+				convertAndImportMessages(session, priorMessages, customToolNameToSdk);
+			}
+			if ((session as any)._pendingRecords?.length) {
+				session.save();
+			} else if (session.messages.length > 0) {
+				const recreate = createSession({
+					projectPath: cwd,
+					claudeDir: process.env.CLAUDE_CONFIG_DIR,
+					sessionId: session.sessionId,
+					...(modelId ? { model: modelId } : {}),
+				});
+				convertAndImportMessages(recreate, priorMessages, customToolNameToSdk);
+				recreate.save();
+			}
+		} catch (e) {
+			debug(`session save retry failed: ${(e as Error).message}`);
+		}
+	}
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd);
 	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
 	if (previousSessionId === undefined) {
@@ -615,6 +688,11 @@ function syncSharedSession(
 		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.messages.length} records`);
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
+	if (session.messages.length > 0 && !existsSync(session.jsonlPath)) {
+		debug(`syncResult: path=rebuild-failed missing jsonl sessionId=${session.sessionId} — starting without resume`);
+		sharedSession = null;
+		return { sessionId: null };
+	}
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
 	return { sessionId: session.sessionId };
 }
@@ -788,7 +866,9 @@ function logServedContextWindow(label: string, message: SDKMessage, model: Model
 // Pi reasoning levels → CC SDK effort levels
 
 const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
-	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max",
+	// Identity map for Claude Code effort. Opus 5 / 4.7+ expose distinct
+	// xhigh and max wire tiers — do not collapse xhigh→max.
+	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
 };
 
 // --- Provider helpers: misc ---
@@ -1334,6 +1414,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
 	const childEnv = { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" };
+	// Final resume guard: never pass a phantom session id to Claude Code.
+	let safeResumeId = resumeSessionId;
+	if (safeResumeId && !sessionFileExists(safeResumeId, cwd)) {
+		debug(`provider: dropping resume ${safeResumeId.slice(0, 8)} — jsonl missing at query time`);
+		invalidateMissingSharedSession(cwd, "pre-query");
+		safeResumeId = null;
+	}
+
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -1348,14 +1436,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		...(effort ? { effort } : {}),
 		...(settingSources ? { settingSources } : {}),
 		...(mcpServers ? { mcpServers } : {}),
-		...(resumeSessionId ? { resume: resumeSessionId } : {}),
+		...(safeResumeId ? { resume: safeResumeId } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 		...makeCliDebugOptions("provider"),
 	};
 
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
-		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
+		`resume=${safeResumeId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
 		`appendSys=${appendSystemPrompt} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
@@ -1432,8 +1520,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
 		})
 		.catch((error) => {
+			const errMsg = error instanceof Error ? error.message : String(error);
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
-			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
+			if (/No conversation found with session ID/i.test(errMsg)) {
+				// Stale resume id — drop it so the next turn rebuilds cleanly.
+				debug(`provider: clearing sharedSession after missing-conversation error`);
+				sharedSession = null;
+			} else if ((wasAborted || options?.signal?.aborted) && sharedSession) {
 				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 			} else {
 				sharedSession = null;
@@ -1441,7 +1534,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
 			if (queryCtx.turnOutput) {
 				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
-				queryCtx.turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
+				let msg = errMsg;
+				if (/No conversation found with session ID/i.test(msg)) {
+					msg = "Claude Code session was missing on disk (stale resume id). Cleared; send again to start a fresh session.";
+				}
+				queryCtx.turnOutput.errorMessage = msg;
 			}
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
 				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
@@ -1506,16 +1603,21 @@ async function promptAndWait(
 	// provider call will see missed messages and trigger a Case 4 rebuild.
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
-		if (sharedSession) {
+		if (sharedSession && sessionFileExists(sharedSession.sessionId, cwd)) {
 			// Provider already has a session — just resume from it
 			// Any missed messages from other providers were already handled by the provider's Case 4
 			resumeSessionId = sharedSession.sessionId;
 		} else {
-			// No provider session yet — create one from pi's context
+			if (sharedSession) invalidateMissingSharedSession(cwd, "askclaude-shared");
+			// No usable provider session yet — create one from pi's context
 			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
 			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId);
 			resumeSessionId = sync.sessionId;
 		}
+	}
+	if (resumeSessionId && !sessionFileExists(resumeSessionId, cwd)) {
+		debug(`askclaude: dropping resume ${resumeSessionId.slice(0, 8)} — jsonl missing`);
+		resumeSessionId = null;
 	}
 
 	// Mode → disallowed tools
